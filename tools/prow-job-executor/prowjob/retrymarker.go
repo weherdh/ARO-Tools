@@ -31,9 +31,12 @@ import (
 // ARO-HCP E2E test binary (aro-hcp-tests, see AROSLSRE-1721) always writes once a run
 // finishes: the full list of failed spec names, and the subset of those that were labeled
 // allow-retry (a known, tracked issue with a fix already committed to). aro-hcp-tests
-// writes both keys into $ARTIFACT_DIR/metadata.json, which Prow's sidecar merges into the
-// job's finished.json under the top-level "metadata" object - the standard Prow
-// custom-metadata mechanism, so no log scraping is involved.
+// writes both keys into $ARTIFACT_DIR/metadata.json, which Prow's sidecar merges into
+// that specific step's own finished.json under the top-level "metadata" object - the
+// standard Prow custom-metadata mechanism, so no log scraping is involved. For ARO-HCP's
+// multi-stage e2e jobs that step-level finished.json lives nested under the build's
+// artifacts/ tree (<build>/artifacts/<workflow>/<step>/finished.json), not at the
+// job-level <build>/finished.json - see jobAllowsEV2Retry below for how we locate it.
 //
 // aro-hcp-tests only reports these raw facts, even when nothing failed (both lists empty);
 // it is prow-job-executor's job (ev2RetryEligible below) to decide whether the shape of a
@@ -70,6 +73,14 @@ type finishedJSON struct {
 	Metadata map[string]interface{} `json:"metadata"`
 }
 
+// gcsObjectBaseURL and gcsJSONAPIBaseURL are the public GCS endpoints this file talks to.
+// They're package-level vars (rather than inlined literals) so tests can point them at a
+// local httptest server instead of stubbing an HTTP client.
+var (
+	gcsObjectBaseURL  = "https://storage.googleapis.com"
+	gcsJSONAPIBaseURL = "https://storage.googleapis.com/storage/v1/b"
+)
+
 // finishedJSONURLFromViewURL converts a Prow Deck "view" URL (the one
 // reported in ProwJob.Status.URL, e.g.
 // https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/<job>/<build>)
@@ -94,45 +105,201 @@ func finishedJSONURLFromViewURL(viewURL string) (string, error) {
 	if gcsPath == "" {
 		return "", fmt.Errorf("job status URL %q has an empty GCS path after the %q prefix", viewURL, viewPrefix)
 	}
-	return fmt.Sprintf("https://storage.googleapis.com/%s/finished.json", gcsPath), nil
+	return fmt.Sprintf("%s/%s/finished.json", gcsObjectBaseURL, gcsPath), nil
 }
 
 // jobAllowsEV2Retry fetches finished.json for the job reported at viewURL and reports
 // whether its ev2FailedTestsKey/ev2AllowRetryTestsKey metadata qualifies for an automatic
 // EV2 gating retry, per ev2RetryEligible.
+//
+// ARO-HCP e2e jobs are multi-stage ci-operator tests (lease-acquire, write-config, the
+// actual test container, gather-*, lease-release, ...). Prow's sidecar merges each step's
+// own $ARTIFACT_DIR/metadata.json into THAT STEP's OWN finished.json
+// (<build>/artifacts/<workflow>/<step>/finished.json) - never into the job-level
+// finished.json (<build>/finished.json) that viewURL itself resolves to, whose "metadata"
+// object is ci-operator's own job bookkeeping (pod, revision, repo, ...) and never carries
+// per-step custom keys. Checking only the job-level finished.json therefore always found
+// ev2FailedTestsKey absent on every real multi-stage job and silently reported "not
+// eligible" with no error - verified empirically against real ARO-HCP prod/stage/PR e2e
+// jobs (AROSLSRE-1721 postmortem). We therefore check every candidate finished.json - the
+// job-level one first (in case ci-operator does aggregate it there for some job shape),
+// then every step nested under the build's artifacts/ tree - and use whichever one
+// actually carries ev2FailedTestsKey.
 func jobAllowsEV2Retry(ctx context.Context, viewURL string, maxAutoRetryFailures int) (bool, error) {
-	rawURL, err := finishedJSONURLFromViewURL(viewURL)
+	jobFinishedURL, err := finishedJSONURLFromViewURL(viewURL)
 	if err != nil {
 		return false, err
 	}
-	return fetchFinishedJSONAllowsRetry(ctx, rawURL, maxAutoRetryFailures)
+
+	bucket, buildPath, err := gcsBucketAndBuildPath(jobFinishedURL)
+	if err != nil {
+		return false, err
+	}
+	stepURLs, err := listStepFinishedJSONURLs(ctx, bucket, buildPath)
+	if err != nil {
+		return false, err
+	}
+
+	candidateURLs := append([]string{jobFinishedURL}, stepURLs...)
+	for _, rawURL := range candidateURLs {
+		metadata, found, err := fetchFinishedJSONMetadata(ctx, rawURL)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			continue // 404: this step doesn't exist for this job shape.
+		}
+		if _, present := metadata[ev2FailedTestsKey]; !present {
+			continue // this step's metadata doesn't carry our keys - not the test step.
+		}
+
+		failed, ok := stringSliceFromMetadata(metadata, ev2FailedTestsKey)
+		if !ok {
+			return false, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2FailedTestsKey)
+		}
+		allowRetry, ok := stringSliceFromMetadata(metadata, ev2AllowRetryTestsKey)
+		if !ok {
+			return false, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2AllowRetryTestsKey)
+		}
+		return ev2RetryEligible(failed, allowRetry, maxAutoRetryFailures), nil
+	}
+	// No candidate finished.json carried ev2FailedTestsKey at all - the aro-hcp-tests
+	// step either never ran or its metadata write failed. Nothing to retry.
+	return false, nil
 }
 
-// fetchFinishedJSONAllowsRetry downloads rawURL as a finished.json document and reports
-// whether its metadata qualifies for an automatic EV2 gating retry. Split out from
-// jobAllowsEV2Retry so the HTTP fetch/parse logic can be tested against a local httptest
-// server, independent of GCS URL construction.
-func fetchFinishedJSONAllowsRetry(ctx context.Context, rawURL string, maxAutoRetryFailures int) (bool, error) {
+// gcsBucketAndBuildPath splits a storage.googleapis.com finished.json URL (as produced by
+// finishedJSONURLFromViewURL) back into its bucket and build-directory object path, so
+// listStepFinishedJSONURLs can enumerate that build's artifacts/ tree.
+func gcsBucketAndBuildPath(finishedURL string) (bucket, buildPath string, err error) {
+	prefix := gcsObjectBaseURL + "/"
+	if !strings.HasPrefix(finishedURL, prefix) {
+		return "", "", fmt.Errorf("finished.json URL %q is not a %s URL", finishedURL, gcsObjectBaseURL)
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(finishedURL, prefix), "/finished.json")
+	bucket, buildPath, ok := strings.Cut(rest, "/")
+	if !ok || bucket == "" || buildPath == "" {
+		return "", "", fmt.Errorf("finished.json URL %q does not contain both a bucket and a build path", finishedURL)
+	}
+	return bucket, buildPath, nil
+}
+
+// gcsListTimeout bounds each GCS directory-listing call used to discover per-step
+// finished.json files.
+const gcsListTimeout = 15 * time.Second
+
+// gcsListMaxPrefixes caps how many directory entries we'll walk at each artifacts/ tree
+// level. ARO-HCP e2e jobs have a handful of multi-stage steps (lease-acquire,
+// write-config, the test container, a couple of gather-*, lease-release); anything near
+// this cap means the tree looks nothing like what we expect, or the listing was
+// paginated, so we fail closed rather than silently missing a remainder page.
+const gcsListMaxPrefixes = 100
+
+// gcsListResponse is the subset of the GCS JSON API's objects.list response
+// (https://cloud.google.com/storage/docs/json_api/v1/objects/list) we need: the
+// "directory" entries found at the requested prefix+delimiter.
+type gcsListResponse struct {
+	Prefixes      []string `json:"prefixes"`
+	NextPageToken string   `json:"nextPageToken"`
+}
+
+// listGCSPrefixes lists the immediate "subdirectories" under prefix in bucket, using
+// GCS's public, unauthenticated JSON API with delimiter=/ - the same trick gsutil/gcsweb
+// use to browse a GCS "directory" without listing every object beneath it recursively.
+func listGCSPrefixes(ctx context.Context, bucket, prefix string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, gcsListTimeout)
+	defer cancel()
+
+	listURL := fmt.Sprintf("%s/%s/o?prefix=%s&delimiter=%s&fields=%s",
+		gcsJSONAPIBaseURL, url.QueryEscape(bucket), url.QueryEscape(prefix), url.QueryEscape("/"), url.QueryEscape("prefixes,nextPageToken"))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCS list request for %q: %w", prefix, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list GCS prefix %q: %w", prefix, err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			logr.FromContextOrDiscard(ctx).Error(cerr, "failed to close body")
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to list GCS prefix %q: unexpected status %d", prefix, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFinishedJSONBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read GCS list response for %q: %w", prefix, err)
+	}
+	if len(body) > maxFinishedJSONBytes {
+		return nil, fmt.Errorf("GCS list response for %q exceeds %d byte limit", prefix, maxFinishedJSONBytes)
+	}
+
+	var listResp gcsListResponse
+	if err := json.Unmarshal(body, &listResp); err != nil {
+		return nil, fmt.Errorf("failed to decode GCS list response for %q: %w", prefix, err)
+	}
+	if listResp.NextPageToken != "" || len(listResp.Prefixes) > gcsListMaxPrefixes {
+		return nil, fmt.Errorf("GCS prefix %q has more than %d entries or is paginated - refusing to guess which step ran the tests", prefix, gcsListMaxPrefixes)
+	}
+	return listResp.Prefixes, nil
+}
+
+// listStepFinishedJSONURLs finds every per-step finished.json nested under a build's
+// artifacts/ directory, by walking the two directory levels ci-operator always creates
+// there (the workflow name, then one directory per step) - without assuming any
+// particular step name, since that varies by job (e.g. aro-hcp-test-persistent for
+// postsubmits, aro-hcp-test-local for presubmits).
+func listStepFinishedJSONURLs(ctx context.Context, bucket, buildPath string) ([]string, error) {
+	workflowPrefixes, err := listGCSPrefixes(ctx, bucket, buildPath+"/artifacts/")
+	if err != nil {
+		return nil, err
+	}
+
+	var stepURLs []string
+	for _, workflowPrefix := range workflowPrefixes {
+		stepPrefixes, err := listGCSPrefixes(ctx, bucket, workflowPrefix)
+		if err != nil {
+			return nil, err
+		}
+		for _, stepPrefix := range stepPrefixes {
+			stepURLs = append(stepURLs, fmt.Sprintf("%s/%s/%sfinished.json", gcsObjectBaseURL, bucket, stepPrefix))
+		}
+	}
+	return stepURLs, nil
+}
+
+// fetchFinishedJSONMetadata downloads rawURL as a finished.json document and returns its
+// free-form "metadata" object. found is false (with a nil error) only when rawURL doesn't
+// exist (404) - callers walking multiple candidate step URLs should treat that as "this
+// step doesn't exist for this job shape" and move on, rather than as an error.
+func fetchFinishedJSONMetadata(ctx context.Context, rawURL string) (metadata map[string]interface{}, found bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, finishedJSONFetchTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return false, fmt.Errorf("failed to create finished.json request: %w", err)
+		return nil, false, fmt.Errorf("failed to create finished.json request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("failed to fetch finished.json %q: %w", rawURL, err)
+		return nil, false, fmt.Errorf("failed to fetch finished.json %q: %w", rawURL, err)
 	}
 	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			logr.FromContextOrDiscard(ctx).Error(err, "failed to close body")
+		if cerr := resp.Body.Close(); cerr != nil {
+			logr.FromContextOrDiscard(ctx).Error(cerr, "failed to close body")
 		}
 	}()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("failed to fetch finished.json %q: unexpected status %d", rawURL, resp.StatusCode)
+		return nil, false, fmt.Errorf("failed to fetch finished.json %q: unexpected status %d", rawURL, resp.StatusCode)
 	}
 
 	// Read one byte past the cap so we can distinguish "fits within the cap" from
@@ -140,22 +307,37 @@ func fetchFinishedJSONAllowsRetry(ctx context.Context, rawURL string, maxAutoRet
 	// long as valid JSON appears before the limit, which defeats the fail-closed intent.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFinishedJSONBytes+1))
 	if err != nil {
-		return false, fmt.Errorf("failed to read finished.json %q: %w", rawURL, err)
+		return nil, false, fmt.Errorf("failed to read finished.json %q: %w", rawURL, err)
 	}
 	if len(body) > maxFinishedJSONBytes {
-		return false, fmt.Errorf("finished.json %q exceeds %d byte limit", rawURL, maxFinishedJSONBytes)
+		return nil, false, fmt.Errorf("finished.json %q exceeds %d byte limit", rawURL, maxFinishedJSONBytes)
 	}
 
 	var finished finishedJSON
 	if err := json.Unmarshal(body, &finished); err != nil {
-		return false, fmt.Errorf("failed to decode finished.json %q: %w", rawURL, err)
+		return nil, false, fmt.Errorf("failed to decode finished.json %q: %w", rawURL, err)
+	}
+	return finished.Metadata, true, nil
+}
+
+// fetchFinishedJSONAllowsRetry downloads rawURL as a finished.json document and reports
+// whether its metadata qualifies for an automatic EV2 gating retry. This is the
+// single-known-URL building block underneath fetchFinishedJSONMetadata; jobAllowsEV2Retry
+// itself walks multiple candidate URLs (see above) rather than trusting a single one.
+func fetchFinishedJSONAllowsRetry(ctx context.Context, rawURL string, maxAutoRetryFailures int) (bool, error) {
+	metadata, found, err := fetchFinishedJSONMetadata(ctx, rawURL)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("failed to fetch finished.json %q: unexpected status %d", rawURL, http.StatusNotFound)
 	}
 
-	failed, ok := stringSliceFromMetadata(finished.Metadata, ev2FailedTestsKey)
+	failed, ok := stringSliceFromMetadata(metadata, ev2FailedTestsKey)
 	if !ok {
 		return false, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2FailedTestsKey)
 	}
-	allowRetry, ok := stringSliceFromMetadata(finished.Metadata, ev2AllowRetryTestsKey)
+	allowRetry, ok := stringSliceFromMetadata(metadata, ev2AllowRetryTestsKey)
 	if !ok {
 		return false, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2AllowRetryTestsKey)
 	}
