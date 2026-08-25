@@ -121,14 +121,18 @@ func finishedJSONURLFromViewURL(viewURL string) (string, error) {
 // per-step custom keys. Checking only the job-level finished.json therefore always found
 // ev2FailedTestsKey absent on every real multi-stage job and silently reported "not
 // eligible" with no error - verified empirically against real ARO-HCP prod/stage/PR e2e
-// jobs (AROSLSRE-1721 postmortem). We therefore check every candidate finished.json - the
-// job-level one first (in case ci-operator does aggregate it there for some job shape),
-// then every step nested under the build's artifacts/ tree - and use whichever one
-// actually carries ev2FailedTestsKey.
+// jobs (AROSLSRE-1721 postmortem). We check the job-level finished.json first - cheap, and
+// sufficient on its own for any job shape where ci-operator does aggregate it there - and
+// only pay for listing the build's artifacts/ tree when that candidate doesn't carry
+// ev2FailedTestsKey at all.
 func jobAllowsEV2Retry(ctx context.Context, viewURL string, maxAutoRetryFailures int) (bool, error) {
 	jobFinishedURL, err := finishedJSONURLFromViewURL(viewURL)
 	if err != nil {
 		return false, err
+	}
+
+	if eligible, done, err := ev2RetryEligibleFromFinishedJSON(ctx, jobFinishedURL, maxAutoRetryFailures); done {
+		return eligible, err
 	}
 
 	bucket, buildPath, err := gcsBucketAndBuildPath(jobFinishedURL)
@@ -139,33 +143,43 @@ func jobAllowsEV2Retry(ctx context.Context, viewURL string, maxAutoRetryFailures
 	if err != nil {
 		return false, err
 	}
-
-	candidateURLs := append([]string{jobFinishedURL}, stepURLs...)
-	for _, rawURL := range candidateURLs {
-		metadata, found, err := fetchFinishedJSONMetadata(ctx, rawURL)
-		if err != nil {
-			return false, err
+	for _, rawURL := range stepURLs {
+		if eligible, done, err := ev2RetryEligibleFromFinishedJSON(ctx, rawURL, maxAutoRetryFailures); done {
+			return eligible, err
 		}
-		if !found {
-			continue // 404: this step doesn't exist for this job shape.
-		}
-		if _, present := metadata[ev2FailedTestsKey]; !present {
-			continue // this step's metadata doesn't carry our keys - not the test step.
-		}
-
-		failed, ok := stringSliceFromMetadata(metadata, ev2FailedTestsKey)
-		if !ok {
-			return false, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2FailedTestsKey)
-		}
-		allowRetry, ok := stringSliceFromMetadata(metadata, ev2AllowRetryTestsKey)
-		if !ok {
-			return false, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2AllowRetryTestsKey)
-		}
-		return ev2RetryEligible(failed, allowRetry, maxAutoRetryFailures), nil
 	}
 	// No candidate finished.json carried ev2FailedTestsKey at all - the aro-hcp-tests
 	// step either never ran or its metadata write failed. Nothing to retry.
 	return false, nil
+}
+
+// ev2RetryEligibleFromFinishedJSON fetches rawURL and, only if its metadata carries
+// ev2FailedTestsKey, decides EV2 retry eligibility for it. done is true whenever the
+// caller should stop trying further candidate URLs: either this one had a definitive
+// answer (found the key, or hit a real error), or false when rawURL had nothing to say
+// (404, or metadata present but missing ev2FailedTestsKey) and the caller should move on
+// to the next candidate.
+func ev2RetryEligibleFromFinishedJSON(ctx context.Context, rawURL string, maxAutoRetryFailures int) (eligible, done bool, err error) {
+	metadata, found, err := fetchFinishedJSONMetadata(ctx, rawURL)
+	if err != nil {
+		return false, true, err
+	}
+	if !found {
+		return false, false, nil // 404: this candidate doesn't exist for this job shape.
+	}
+	if _, present := metadata[ev2FailedTestsKey]; !present {
+		return false, false, nil // not the step that ran aro-hcp-tests.
+	}
+
+	failed, ok := stringSliceFromMetadata(metadata, ev2FailedTestsKey)
+	if !ok {
+		return false, true, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2FailedTestsKey)
+	}
+	allowRetry, ok := stringSliceFromMetadata(metadata, ev2AllowRetryTestsKey)
+	if !ok {
+		return false, true, fmt.Errorf("finished.json %q metadata key %q is present but not a list of strings", rawURL, ev2AllowRetryTestsKey)
+	}
+	return ev2RetryEligible(failed, allowRetry, maxAutoRetryFailures), true, nil
 }
 
 // gcsBucketAndBuildPath splits a storage.googleapis.com finished.json URL (as produced by
