@@ -79,7 +79,8 @@ func readAuthFile(path string) (map[string]any, error) {
 }
 
 // writeAuthFile writes through a temporary file in the same directory so a failure part-way
-// through cannot leave the tool holding a truncated credential file.
+// through cannot leave the tool holding a truncated credential file. A bind-mounted auth file
+// cannot be renamed over, so that path falls back to a non-atomic in-place write.
 func writeAuthFile(path string, document map[string]any) error {
 	raw, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
@@ -112,6 +113,10 @@ func writeAuthFile(path string, document map[string]any) error {
 		// A bind-mounted auth file cannot be renamed over (EBUSY), so write through it instead.
 		if fallbackErr := os.WriteFile(path, raw, authFileMode); fallbackErr != nil {
 			return fmt.Errorf("failed to replace auth file %q: %w: in-place write also failed: %w", path, err, fallbackErr)
+		}
+		// WriteFile only applies the mode when it creates the file, so an existing one keeps its own.
+		if chmodErr := os.Chmod(path, authFileMode); chmodErr != nil {
+			return fmt.Errorf("failed to restrict permissions on auth file %q: %w", path, chmodErr)
 		}
 	}
 	return nil
