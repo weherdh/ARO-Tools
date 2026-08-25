@@ -15,6 +15,7 @@
 package prowjob
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,6 +72,204 @@ func TestFinishedJSONURLFromViewURL(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestGCSBucketAndBuildPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		finishedURL string
+		wantBucket  string
+		wantPath    string
+		wantErr     bool
+	}{
+		{
+			name:        "typical finished.json URL",
+			finishedURL: "https://storage.googleapis.com/origin-ci-test/logs/some-job/1/finished.json",
+			wantBucket:  "origin-ci-test",
+			wantPath:    "logs/some-job/1",
+		},
+		{
+			name:        "not a storage.googleapis.com URL",
+			finishedURL: "https://example.com/origin-ci-test/logs/some-job/1/finished.json",
+			wantErr:     true,
+		},
+		{
+			name:        "missing build path",
+			finishedURL: "https://storage.googleapis.com/finished.json",
+			wantErr:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bucket, buildPath, err := gcsBucketAndBuildPath(tc.finishedURL)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got bucket %q buildPath %q", bucket, buildPath)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if bucket != tc.wantBucket || buildPath != tc.wantPath {
+				t.Fatalf("got bucket %q buildPath %q, want bucket %q buildPath %q", bucket, buildPath, tc.wantBucket, tc.wantPath)
+			}
+		})
+	}
+}
+
+// gcsTestServer serves a minimal, in-memory approximation of the two public GCS endpoints
+// jobAllowsEV2Retry talks to: the JSON API's objects.list (for listGCSPrefixes, keyed by
+// its "prefix" query param) and plain object GETs (for fetchFinishedJSONMetadata, keyed by
+// path). It lets tests exercise the full artifacts/ tree walk without hitting real GCS.
+func gcsTestServer(t *testing.T, listByPrefix map[string][]string, objectsByPath map[string]string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/storage/v1/b/", func(w http.ResponseWriter, r *http.Request) {
+		prefix := r.URL.Query().Get("prefix")
+		prefixes, ok := listByPrefix[prefix]
+		if !ok {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"prefixes":[]}`))
+			return
+		}
+		body, err := json.Marshal(gcsListResponse{Prefixes: prefixes})
+		if err != nil {
+			t.Fatalf("failed to marshal test list response: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		body, ok := objectsByPath[r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	})
+	return httptest.NewServer(mux)
+}
+
+// withGCSTestServer points gcsObjectBaseURL/gcsJSONAPIBaseURL at srv for the duration of
+// the calling test, restoring the real endpoints on cleanup.
+func withGCSTestServer(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	origObjectBase, origAPIBase := gcsObjectBaseURL, gcsJSONAPIBaseURL
+	gcsObjectBaseURL = srv.URL
+	gcsJSONAPIBaseURL = srv.URL + "/storage/v1/b"
+	t.Cleanup(func() {
+		gcsObjectBaseURL, gcsJSONAPIBaseURL = origObjectBase, origAPIBase
+		srv.Close()
+	})
+}
+
+func TestJobAllowsEV2RetryFindsStepLevelMetadata(t *testing.T) {
+	// Mirrors the real ARO-HCP multi-stage layout observed in AROSLSRE-1721: the
+	// job-level finished.json's metadata never carries the ev2 keys, but the test
+	// step's own finished.json (nested two levels under artifacts/) does.
+	const bucket = "test-platform-results"
+	const buildPath = "logs/branch-ci-Azure-ARO-HCP-main-e2e-prod-e2e-parallel/12345"
+
+	srv := gcsTestServer(t,
+		map[string][]string{
+			buildPath + "/artifacts/": {buildPath + "/artifacts/prod-e2e-parallel/"},
+			buildPath + "/artifacts/prod-e2e-parallel/": {
+				buildPath + "/artifacts/prod-e2e-parallel/aro-hcp-lease-acquire/",
+				buildPath + "/artifacts/prod-e2e-parallel/aro-hcp-test-persistent/",
+				buildPath + "/artifacts/prod-e2e-parallel/aro-hcp-lease-release/",
+			},
+		},
+		map[string]string{
+			"/" + bucket + "/" + buildPath + "/finished.json":                                                     `{"metadata":{"pod":"abc"}}`,
+			"/" + bucket + "/" + buildPath + "/artifacts/prod-e2e-parallel/aro-hcp-lease-acquire/finished.json":   `{"metadata":{}}`,
+			"/" + bucket + "/" + buildPath + "/artifacts/prod-e2e-parallel/aro-hcp-lease-release/finished.json":   `{"metadata":{}}`,
+			"/" + bucket + "/" + buildPath + "/artifacts/prod-e2e-parallel/aro-hcp-test-persistent/finished.json": `{"metadata":{"ev2-failed-tests":["spec A"],"ev2-allow-retry-tests":["spec A"]}}`,
+		},
+	)
+	withGCSTestServer(t, srv)
+
+	viewURL := "https://prow.ci.openshift.org/view/gs/" + bucket + "/" + buildPath
+	got, err := jobAllowsEV2Retry(testContext(), viewURL, DefaultMaxEV2AutoRetryFailures)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Fatal("got false, want true: the step-level finished.json carries a single allow-retry failure")
+	}
+}
+
+func TestJobAllowsEV2RetryNoStepCarriesMetadata(t *testing.T) {
+	// If nothing under artifacts/ (nor the job-level finished.json) carries
+	// ev2FailedTestsKey at all, there's nothing to retry - and it's not an error.
+	const bucket = "test-platform-results"
+	const buildPath = "logs/some-job/1"
+
+	srv := gcsTestServer(t,
+		map[string][]string{
+			buildPath + "/artifacts/": {buildPath + "/artifacts/some-workflow/"},
+			buildPath + "/artifacts/some-workflow/": {
+				buildPath + "/artifacts/some-workflow/some-step/",
+			},
+		},
+		map[string]string{
+			"/" + bucket + "/" + buildPath + "/finished.json":                                   `{"metadata":{"pod":"abc"}}`,
+			"/" + bucket + "/" + buildPath + "/artifacts/some-workflow/some-step/finished.json": `{"metadata":{}}`,
+		},
+	)
+	withGCSTestServer(t, srv)
+
+	viewURL := "https://prow.ci.openshift.org/view/gs/" + bucket + "/" + buildPath
+	got, err := jobAllowsEV2Retry(testContext(), viewURL, DefaultMaxEV2AutoRetryFailures)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got {
+		t.Fatal("got true, want false: no candidate finished.json carried ev2-failed-tests")
+	}
+}
+
+func TestJobAllowsEV2RetryUsesJobLevelMetadataWhenPresent(t *testing.T) {
+	// If some job shape genuinely does aggregate the keys into the job-level
+	// finished.json, that's still honored - we don't require the nested layout.
+	const bucket = "test-platform-results"
+	const buildPath = "logs/some-job/1"
+
+	srv := gcsTestServer(t,
+		map[string][]string{buildPath + "/artifacts/": {}},
+		map[string]string{
+			"/" + bucket + "/" + buildPath + "/finished.json": `{"metadata":{"ev2-failed-tests":[],"ev2-allow-retry-tests":[]}}`,
+		},
+	)
+	withGCSTestServer(t, srv)
+
+	viewURL := "https://prow.ci.openshift.org/view/gs/" + bucket + "/" + buildPath
+	got, err := jobAllowsEV2Retry(testContext(), viewURL, DefaultMaxEV2AutoRetryFailures)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got {
+		t.Fatal("got true, want false: job-level metadata reports a clean run")
+	}
+}
+
+func TestListGCSPrefixesRejectsPagination(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"prefixes":["a/","b/"],"nextPageToken":"more"}`))
+	}))
+	defer srv.Close()
+
+	origAPIBase := gcsJSONAPIBaseURL
+	gcsJSONAPIBaseURL = srv.URL
+	defer func() { gcsJSONAPIBaseURL = origAPIBase }()
+
+	_, err := listGCSPrefixes(testContext(), "bucket", "some/prefix/")
+	if err == nil {
+		t.Fatal("expected an error for a paginated listing, got nil")
 	}
 }
 
