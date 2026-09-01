@@ -28,7 +28,8 @@ import (
 const authFileMode fs.FileMode = 0o600
 
 // UpsertCredential adds or replaces the entry for one registry in a container auth file,
-// leaving every other registry and any fields we don't model untouched.
+// leaving every other registry untouched. Fields we do not model are preserved, except
+// identitytoken on the entry being replaced.
 func UpsertCredential(path, registry, username, password string) error {
 	if registry == "" {
 		return errors.New("registry must not be empty")
@@ -49,6 +50,9 @@ func UpsertCredential(path, registry, username, password string) error {
 		entry = map[string]any{}
 	}
 	entry["auth"] = base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	// containers/image prefers a non-empty identitytoken over auth, so leaving a stale one
+	// behind would shadow the credential written above.
+	delete(entry, "identitytoken")
 
 	auths[registry] = entry
 	document["auths"] = auths

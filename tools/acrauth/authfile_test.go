@@ -60,6 +60,28 @@ func TestUpsertCredentialPreservesOtherRegistries(t *testing.T) {
 	require.Equal(t, expectedAuth(t, NullGUIDUsername, "token"), added["auth"])
 }
 
+func TestUpsertCredentialDropsStaleIdentityToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	existing := `{
+  "auths": {
+    "acr.azurecr.io": { "auth": "b2xkOmNyZWQ=", "identitytoken": "stale-refresh-token" },
+    "registry.redhat.io": { "auth": "cmVkaGF0OnNlY3JldA==", "identitytoken": "keep-me" }
+  }
+}`
+	require.NoError(t, os.WriteFile(path, []byte(existing), 0o600))
+
+	require.NoError(t, UpsertCredential(path, "acr.azurecr.io", NullGUIDUsername, "new-token"))
+
+	auths := readBack(t, path)["auths"].(map[string]any)
+
+	replaced := auths["acr.azurecr.io"].(map[string]any)
+	require.Equal(t, expectedAuth(t, NullGUIDUsername, "new-token"), replaced["auth"])
+	require.NotContains(t, replaced, "identitytoken", "containers/image prefers identitytoken over auth, so a stale one would shadow the new credential")
+
+	untouched := auths["registry.redhat.io"].(map[string]any)
+	require.Equal(t, "keep-me", untouched["identitytoken"], "only the replaced entry should lose its identity token")
+}
+
 func TestUpsertCredentialReplacesSameRegistry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.json")
 	require.NoError(t, UpsertCredential(path, "acr.azurecr.io", NullGUIDUsername, "first"))
