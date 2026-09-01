@@ -115,12 +115,13 @@ func writeAuthFile(path string, document map[string]any) error {
 
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		// A bind-mounted auth file cannot be renamed over (EBUSY), so write through it instead.
+		// Restrict first: WriteFile only applies its mode when it creates the file, so writing
+		// into an existing world-readable one would expose the credential before we could chmod.
+		if chmodErr := os.Chmod(path, authFileMode); chmodErr != nil && !errors.Is(chmodErr, fs.ErrNotExist) {
+			return fmt.Errorf("failed to replace auth file %q: %w: failed to restrict permissions: %w", path, err, chmodErr)
+		}
 		if fallbackErr := os.WriteFile(path, raw, authFileMode); fallbackErr != nil {
 			return fmt.Errorf("failed to replace auth file %q: %w: in-place write also failed: %w", path, err, fallbackErr)
-		}
-		// WriteFile only applies the mode when it creates the file, so an existing one keeps its own.
-		if chmodErr := os.Chmod(path, authFileMode); chmodErr != nil {
-			return fmt.Errorf("failed to restrict permissions on auth file %q: %w", path, chmodErr)
 		}
 	}
 	return nil
